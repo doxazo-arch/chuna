@@ -236,63 +236,67 @@ function drawStrings(t){if(running&&!allDone){const energy=Math.sqrt(buffer.redu
 function blinkLater(i){setTimeout(()=>{const p=document.querySelector(`[data-string="${i}"]:not(.done)`);if(p)hop(p.querySelector('svg'),'face-switch');blinkLater(i);},6000+Math.random()*4000);}characters.forEach((_,i)=>blinkLater(i));
 </script><style>.dozing #buddy{animation:breathe 3.2s ease-in-out infinite;transform-origin:50% 86%}.doze-bubble{position:absolute;right:8%;top:6%;width:calc(var(--u)*.06);height:calc(var(--u)*.06);border-radius:50%;background:#F5F5F5;opacity:0;pointer-events:none;transform-origin:30% 70%}.dozing .doze-bubble{opacity:.9;animation:dozeb 3.2s ease-in-out infinite}@keyframes dozeb{50%{transform:scale(2.2)}}@media(prefers-reduced-motion:reduce){.dozing #buddy,.dozing .doze-bubble{animation:none}}</style>
 <script id="mic-recovery">
-// Mic recovery: iOS Safari can suspend/interrupt the AudioContext or end/mute the mic track
-// (screen lock, background, calls, Siri, other apps, long idle). Recover silently; if iOS needs a gesture, doze and wake on any tap.
-(()=>{let mic='idle',recovering=false,flatSince=null,watchedCtx=null,watchedTrack=null;const probe=new Float32Array(1024);
+// Mic recovery (v23): ONE health check + recovery path for every tap and for returning to the app.
+// iOS can silently kill the pipeline while idle / screen-off / backgrounded: AudioContext 'suspended' or
+// 'interrupted', MediaStreamTrack ended or muted while 'live', or a 'running' context whose analyser only
+// ever sees exact zeros. A real mic is never perfectly flat, so flat samples = dead pipeline.
+// Order of repair: resume -> reconnect the same stream -> full rebuild (new getUserMedia + new context).
+// getUserMedia is only ever called from a user tap (returning to the app only resumes/reconnects; a dead track dozes until the next tap).
+(()=>{let mic='idle',busy=false,watchedCtx=null,watchedTrack=null,lastLive=performance.now(),flatSince=null;const probe=new Float32Array(1024);
 const isTest=params.get('test')==='1';
 function track(){return source&&source.mediaStream?source.mediaStream.getAudioTracks()[0]:null;}
-function setMic(m){mic=m;window.__micState={mic,ctx:ctx?ctx.state:null,track:track()?track().readyState:null,muted:track()?track().muted:null};$('app').classList.toggle('dozing',m==='needsTap');if(m==='needsTap'){face('sleepy');$('buddy').classList.remove('sway');}}
+function state(){window.__micState={mic,ctx:ctx?ctx.state:null,track:track()?track().readyState:null,muted:track()?track().muted:null};}
+function setMic(m){mic=m;state();$('app').classList.toggle('dozing',m==='needsTap');if(m==='needsTap'){face('sleepy');$('buddy').classList.remove('sway');}}
 function bubble(){if(!document.querySelector('.doze-bubble')){const b=document.createElement('div');b.className='doze-bubble';$('jumper').append(b);}}
-function watch(){if(ctx&&watchedCtx!==ctx){watchedCtx=ctx;ctx.addEventListener('statechange',()=>{if(running&&ctx.state!=='running'&&!document.hidden)recover('statechange');});}
- const t=track();if(t&&watchedTrack!==t){watchedTrack=t;t.addEventListener('ended',()=>recover('ended'));t.addEventListener('mute',()=>setTimeout(()=>{if(t.muted)recover('mute');},1500));}}
-const timeout=(p,ms)=>Promise.race([p,new Promise(r=>setTimeout(()=>r('timeout'),ms))]);
+function watch(){if(ctx&&watchedCtx!==ctx){watchedCtx=ctx;ctx.addEventListener('statechange',()=>{if(running&&ctx.state!=='running'&&!document.hidden)ensureAudio('statechange');});}
+ const t=track();if(t&&watchedTrack!==t){watchedTrack=t;t.addEventListener('ended',()=>ensureAudio('ended'));t.addEventListener('mute',()=>setTimeout(()=>{if(t.muted)ensureAudio('mute');},1000));t.addEventListener('unmute',()=>ensureAudio('unmute'));}}
+const timeout=(p,ms)=>Promise.race([p,new Promise(r=>setTimeout(()=>r('timeout'),ms))]);const wait=ms=>new Promise(r=>setTimeout(r,ms));
 function askMic(){window.__gumCalls=(window.__gumCalls||0)+1;return navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});}
-async function newStream(pending){const old=source;const s=await pending;
- try{old.mediaStream.getTracks().forEach(t=>t.stop());old.disconnect();}catch(_){}source=ctx.createMediaStreamSource(s);source.connect(highpass);flatSince=null;watch();}
-async function recover(why,gesture){if(!running||recovering||document.hidden)return;
- // A dead mic track is only re-requested inside a user tap (getUserMedia called synchronously here, before any await).
- const dead=!isTest&&track()&&(track().readyState==='ended'||(why==='mute'&&track().muted));if(dead&&!gesture){setMic('needsTap');window.__micLastRecover=why;return;}
- const pending=dead&&gesture?askMic():null;recovering=true;setMic('recovering');window.__micLastRecover=why;
- try{if(ctx.state!=='running'){await timeout(ctx.resume().catch(()=>{}),gesture?3000:800);}
-  const t=track();if(pending){try{await newStream(pending);}catch(_){}} // re-ask the mic ONLY for a truly dead track (each getUserMedia can show the iOS dialog)
-  const t2=track();const ok=ctx.state==='running'&&(isTest||(t2&&t2.readyState==='live'));
-  if(ok){const was=mic==='needsTap'||$('app').classList.contains('dozing');setMic('live');lastSignal=performance.now();requestWakeLock();if(was){face('normal');hop($('jumper'));}}
-  else setMic('needsTap');}
- finally{recovering=false;}}
-window.__micRecover=recover;
-// Wake tap from doze: if anything is off (track ended/muted, context not running), rebuild everything
-// inside the gesture: fresh getUserMedia + fresh AudioContext (both started synchronously), new graph, old ones closed.
-function needsRebuild(){const t=track();return ctx.state!=='running'||(!isTest&&(!t||t.readyState!=='live'||t.muted));}
+function trackDead(){const t=track();return !isTest&&(!t||t.readyState!=='live'||t.muted);}
+function flatOnce(){if(!analyser)return true;analyser.getFloatTimeDomainData(probe);for(let i=1;i<probe.length;i++)if(probe[i]!==probe[0])return false;return true;}
+async function flatFor(ms){const end=performance.now()+ms;let first=null;while(performance.now()<end){if(!flatOnce())return false;if(first===null)first=probe[0];else if(probe[0]!==first)return false;await wait(60);}return true;}
+function healthySync(){return ctx&&ctx.state==='running'&&!trackDead()&&performance.now()-lastLive<700;}
+function reconnect(){if(!source||!source.mediaStream)return false;try{source.disconnect();}catch(_){}try{source=ctx.createMediaStreamSource(source.mediaStream);source.connect(highpass);window.__reconnects=(window.__reconnects||0)+1;return true;}catch(_){return false;}}
 function graph(c,stream,freq){const hp=c.createBiquadFilter();hp.type='highpass';hp.frequency.value=30;const lp=c.createBiquadFilter();lp.type='lowpass';lp.frequency.value=1000;const an=c.createAnalyser();an.fftSize=4096;let src;
  if(stream){src=c.createMediaStreamSource(stream);src.connect(hp);}else{src=c.createOscillator();src.setPeriodicWave(c.createPeriodicWave(new Float32Array(6),new Float32Array([0,1,.6,.4,.25,.15])));src.frequency.value=freq||110;const g=c.createGain();g.gain.value=.04;src.connect(g);g.connect(hp);src.start();}
  hp.connect(lp);lp.connect(an);const m=c.createGain();m.gain.value=0;an.connect(m);m.connect(c.destination);return {hp,lp,an,src};}
-function signalFlowing(){const b=new Float32Array(2048);analyser.getFloatTimeDomainData(b);let e=0;for(const v of b)e+=v*v;return Math.sqrt(e/b.length)>1e-7;}
-async function rebuild(why,attempt=0){if(recovering)return;recovering=true;setMic('recovering');window.__micLastRecover=why;window.__rebuilds=(window.__rebuilds||0)+1;
+// Full rebuild. getUserMedia + new AudioContext are both started synchronously (still inside the tap when called from one).
+async function rebuild(why){window.__rebuilds=(window.__rebuilds||0)+1;window.__micLastRecover=why;
  const AC=window.AudioContext||window.webkitAudioContext;const pending=isTest?null:askMic();const c=new AC();const rp=c.resume().catch(()=>{});
  const oldCtx=ctx,oldSrc=source,freq=source&&source.frequency?source.frequency.value:null;
  try{const stream=pending?await timeout(pending,8000):null;if(stream==='timeout')throw new Error('gum timeout');await timeout(rp,3000);
-  try{oldSrc&&oldSrc.mediaStream&&oldSrc.mediaStream.getTracks().forEach(t=>t.stop());}catch(_){}try{oldSrc&&oldSrc.stop&&oldSrc.stop();}catch(_){}try{oldCtx&&oldCtx.close();}catch(_){}
-  const g=graph(c,stream,freq);ctx=c;highpass=g.hp;lowpass=g.lp;analyser=g.an;source=g.src;flatSince=null;watch();
-  holdSince=null;previous=null;lastSignal=performance.now();
-  await new Promise(r=>setTimeout(r,ctx.state==='running'?600:0));
-  const ok=ctx.state==='running'&&(isTest||track()&&track().readyState==='live')&&signalFlowing();
-  if(ok){setMic('live');requestWakeLock();face('normal');hop($('jumper'));}
-  else if(attempt===0&&ctx.state!=='running'){recovering=false;try{await ctx.resume();}catch(_){}if(ctx.state==='running'&&signalFlowing()){setMic('live');face('normal');}else setMic('needsTap');return;}
-  else setMic(signalFlowing()?'live':'needsTap');
- }catch(_){try{c.close();}catch(__){}setMic('needsTap');}finally{recovering=false;}}
-window.__micRebuild=rebuild;
-// Any tap while dozing reconnects inside the gesture (resume must be called synchronously in the tap).
-document.addEventListener('pointerdown',e=>{if(!running)return;if(ctx&&ctx.state!=='running')ctx.resume().catch(()=>{});
- },true);
-document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();if(needsRebuild())rebuild('tap');else recover('tap',true);}},true);
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>recover('visible'),50);});
-addEventListener('pageshow',()=>setTimeout(()=>recover('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>recover('focus'),50));
-// Watchdog: context not running, track not live/muted, or analyser input exactly flat for 3 s while the track claims live.
-setInterval(()=>{if(!running||document.hidden)return;bubble();watch();if(mic==='needsTap')return;if(mic==='idle')setMic('live');
- const t=track();if(ctx.state!=='running'||(!isTest&&(!t||t.readyState!=='live'))){recover('watchdog');return;}
- analyser.getFloatTimeDomainData(probe);let flat=true;for(let i=1;i<probe.length;i++)if(probe[i]!==probe[0]){flat=false;break;}
- const now=performance.now();if(flat){if(flatSince===null)flatSince=now;else if(now-flatSince>3000){flatSince=null;recover('flat');}}else flatSince=null;
- window.__micState={mic,ctx:ctx.state,track:t?t.readyState:null,muted:t?t.muted:null};},1000);
+  try{oldSrc&&oldSrc.mediaStream&&oldSrc.mediaStream.getTracks().forEach(t=>t.stop());}catch(_){}try{oldSrc&&oldSrc.stop&&oldSrc.stop();}catch(_){}try{oldCtx&&oldCtx.state!=='closed'&&oldCtx.close();}catch(_){}
+  const g=graph(c,stream,freq);ctx=c;highpass=g.hp;lowpass=g.lp;analyser=g.an;source=g.src;watch();holdSince=null;previous=null;lastSignal=performance.now();
+  if(ctx.state!=='running')try{await timeout(ctx.resume(),1500);}catch(_){}
+  return ctx.state==='running'&&!trackDead(); // a fresh stream is trusted (it may start with a few silent frames)
+ }catch(_){try{c.close();}catch(__){}return false;}}
+function live(){const was=mic==='needsTap'||$('app').classList.contains('dozing');setMic('live');lastLive=performance.now();flatSince=null;lastSignal=performance.now();requestWakeLock();if(was){face('normal');hop($('jumper'));}}
+// why: 'tap' (user gesture), 'visible'/'pageshow' (user came back), anything else = background check (never asks for the mic).
+async function ensureAudio(why,gesture=false){if(!running||busy||document.hidden||window.__transitioning&&!gesture)return;
+ const mayAsk=gesture;window.__micLastRecover=why;const L=window.__micLog=window.__micLog||[];const lg=m=>{L.push(why+':'+m+':'+ctx.state);if(L.length>40)L.shift();};window.__ensureCalls=(window.__ensureCalls||0)+1;
+ // Tap: decide synchronously so a rebuild still runs inside the gesture.
+ if(gesture){if(healthySync()&&mic!=='needsTap')return;if(ctx.state==='running'&&!trackDead()&&performance.now()-lastLive>=700&&flatOnce())reconnect();// flat but live: reconnect first, rebuild only if that fails
+  else if(trackDead()){busy=true;setMic('recovering');try{(await rebuild(why))?live():setMic('needsTap');}finally{busy=false;}return;}
+  try{ctx.resume();}catch(_){}}
+ busy=true;if(mic!=='needsTap')setMic('recovering');
+ try{
+  if(ctx.state!=='running'){try{await timeout(ctx.resume(),gesture?1500:800);}catch(_){}}
+  if(ctx.state==='running'&&!trackDead()){if(!(await flatFor(1100))){live();return;}lg('flat');if(reconnect()&&!(await flatFor(1100))){live();return;}lg('flat2');}
+  lg('fail dead='+trackDead());if(mayAsk){(await rebuild(why))?live():setMic('needsTap');}else setMic('needsTap');
+ }finally{busy=false;state();}}
+window.__micRecover=ensureAudio;
+// Every tap checks health first (pointerdown, capture). A tap while dozing is only used to wake the mic.
+document.addEventListener('pointerdown',()=>{if(running&&mic!=='needsTap')ensureAudio('tap',true);},true);
+document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();ensureAudio('tap',true);}},true);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>ensureAudio('visible'),50);});
+addEventListener('pageshow',()=>setTimeout(()=>ensureAudio('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>ensureAudio('focus'),50));
+// Watchdog (awake only): context/track health every 250 ms; exact-flat samples for >2 s => quiet recovery.
+setInterval(()=>{if(!running||document.hidden)return;bubble();watch();if(mic==='idle')setMic('live');
+ if(!flatOnce()){lastLive=performance.now();flatSince=null;}else if(flatSince===null)flatSince=performance.now();
+ if(mic==='needsTap'||busy){state();return;}
+ if(ctx.state!=='running'||trackDead())ensureAudio('watchdog');
+ else if(flatSince!==null&&performance.now()-flatSince>2000){flatSince=null;ensureAudio('flat');}
+ state();},250);
 })();
 </script>
 <style id="motion-css">.eyes{transform-box:fill-box;transform-origin:50% 50%}#jumper{transform-origin:50% 90%}.peg-motion{transform-origin:50% 80%}
