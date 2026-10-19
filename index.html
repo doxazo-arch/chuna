@@ -176,11 +176,15 @@ function bubble(){if(!document.querySelector('.doze-bubble')){const b=document.c
 function watch(){if(ctx&&watchedCtx!==ctx){watchedCtx=ctx;ctx.addEventListener('statechange',()=>{if(running&&ctx.state!=='running'&&!document.hidden)recover('statechange');});}
  const t=track();if(t&&watchedTrack!==t){watchedTrack=t;t.addEventListener('ended',()=>recover('ended'));t.addEventListener('mute',()=>setTimeout(()=>{if(t.muted)recover('mute');},1500));}}
 const timeout=(p,ms)=>Promise.race([p,new Promise(r=>setTimeout(()=>r('timeout'),ms))]);
-async function newStream(){const old=source;const s=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+function askMic(){window.__gumCalls=(window.__gumCalls||0)+1;return navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});}
+async function newStream(pending){const old=source;const s=await pending;
  try{old.mediaStream.getTracks().forEach(t=>t.stop());old.disconnect();}catch(_){}source=ctx.createMediaStreamSource(s);source.connect(highpass);flatSince=null;watch();}
-async function recover(why,gesture){if(!running||recovering||document.hidden)return;recovering=true;setMic('recovering');window.__micLastRecover=why;
+async function recover(why,gesture){if(!running||recovering||document.hidden)return;
+ // A dead mic track is only re-requested inside a user tap (getUserMedia called synchronously here, before any await).
+ const dead=!isTest&&track()&&track().readyState==='ended';if(dead&&!gesture){setMic('needsTap');window.__micLastRecover=why;return;}
+ const pending=dead?askMic():null;recovering=true;setMic('recovering');window.__micLastRecover=why;
  try{if(ctx.state!=='running'){await timeout(ctx.resume().catch(()=>{}),gesture?3000:800);}
-  const t=track();if(!isTest&&ctx.state==='running'&&t&&t.readyState==='ended'){try{await newStream();}catch(_){}} // re-ask the mic ONLY for a truly dead track (each getUserMedia can show the iOS dialog)
+  const t=track();if(pending){try{await newStream(pending);}catch(_){}} // re-ask the mic ONLY for a truly dead track (each getUserMedia can show the iOS dialog)
   const t2=track();const ok=ctx.state==='running'&&(isTest||(t2&&t2.readyState==='live'));
   if(ok){const was=mic==='needsTap'||$('app').classList.contains('dozing');setMic('live');lastSignal=performance.now();requestWakeLock();if(was){face('normal');hop($('jumper'));}}
   else setMic('needsTap');}
@@ -188,8 +192,8 @@ async function recover(why,gesture){if(!running||recovering||document.hidden)ret
 window.__micRecover=recover;
 // Any tap while dozing reconnects inside the gesture (resume must be called synchronously in the tap).
 document.addEventListener('pointerdown',e=>{if(!running)return;if(ctx&&ctx.state!=='running')ctx.resume().catch(()=>{});
- if(mic==='needsTap'){e.preventDefault();e.stopPropagation();recover('tap',true);}},true);
-document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();}},true);
+ },true);
+document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();recover('tap',true);}},true);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>recover('visible'),50);});
 addEventListener('pageshow',()=>setTimeout(()=>recover('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>recover('focus'),50));
 // Watchdog: context not running, track not live/muted, or analyser input exactly flat for 3 s while the track claims live.
