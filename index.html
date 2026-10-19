@@ -131,7 +131,7 @@ async function start(){if(running){ctx.resume();select(0);requestWakeLock();retu
  source=ctx.createOscillator();source.setPeriodicWave(ctx.createPeriodicWave(new Float32Array(6),new Float32Array([0,1,.6,.4,.25,.15])));const requested=Number(params.get('f'));source.frequency.value=auto?STRING_FREQUENCIES[selected]:requested>0&&Number.isFinite(requested)?requested:110*2**(-12/1200);
  const amplitude=ctx.createGain();amplitude.gain.value=.04;const modulation=ctx.createOscillator(),depth=ctx.createGain();modulation.frequency.value=.3;depth.gain.value=.035;modulation.connect(depth);depth.connect(amplitude.gain);source.connect(amplitude);amplitude.connect(highpass);modulation.start();source.start();}
  highpass.connect(lowpass);lowpass.connect(analyser);const mute=ctx.createGain();mute.gain.value=0;analyser.connect(mute);mute.connect(ctx.destination);
- running=true;try{localStorage.setItem('chuna.started','1');}catch(_){}if(window.__relaunch){window.__relaunch=false;$('app').classList.remove('dozing');}else arrival();select(0);hop($('jumper'));ctx.onstatechange=()=>{if(ctx.state!=='running')holdSince=null;};setInterval(analyze,33);requestWakeLock();
+ running=true;try{localStorage.removeItem('chuna.started');}catch(_){}arrival();select(0);hop($('jumper'));ctx.onstatechange=()=>{if(ctx.state!=='running')holdSince=null;};setInterval(analyze,33);requestWakeLock();
  }catch(_){if(source?.mediaStream)source.mediaStream.getTracks().forEach(track=>track.stop());if(ctx)try{await ctx.close();}catch(_){}show('error');face('sleepy');$('buddy').classList.remove('breathing','sway');$('error').hidden=false;}finally{starting=false;$('start').disabled=false;$('start').classList.remove('waking');}}
 
 function analyze(){if(!running)return;const now=performance.now();if(ctx.state!=='running'||document.hidden){holdSince=null;return;}
@@ -202,17 +202,6 @@ setInterval(()=>{if(!running||document.hidden)return;bubble();watch();if(mic==='
  analyser.getFloatTimeDomainData(probe);let flat=true;for(let i=1;i<probe.length;i++)if(probe[i]!==probe[0]){flat=false;break;}
  const now=performance.now();if(flat){if(flatSince===null)flatSince=now;else if(now-flatSince>3000){flatSince=null;recover('flat');}}else flatSince=null;
  window.__micState={mic,ctx:ctx.state,track:t?t.readyState:null,muted:t?t.muted:null};},1000);
-})();
-</script>
-<script id="relaunch">
-// Returning users open straight on the tuning screen with the character dozing; any tap wakes it
-// and starts audio + getUserMedia inside that tap (one call). First launch keeps the start screen.
-(()=>{let seen=false;try{seen=localStorage.getItem('chuna.started')==='1';}catch(_){}
- if(params.get('relaunch')==='1')seen=true;if(params.get('relaunch')==='0')seen=false;
- if(!seen)return;window.__relaunch=true;show('tuning');render();face('sleepy');$('app').classList.add('dozing');
- if(!document.querySelector('.doze-bubble')){const b=document.createElement('div');b.className='doze-bubble';$('jumper').append(b);}
- const wake=e=>{if(running||starting||!window.__relaunch)return;e.preventDefault();e.stopPropagation();start();};
- document.addEventListener('click',wake,true);document.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')wake(e);},true);
 })();
 </script>
 </body></html>
