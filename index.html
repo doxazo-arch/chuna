@@ -261,8 +261,8 @@ function graph(c,stream,freq){const hp=c.createBiquadFilter();hp.type='highpass'
  if(stream){src=c.createMediaStreamSource(stream);src.connect(hp);}else{src=c.createOscillator();src.setPeriodicWave(c.createPeriodicWave(new Float32Array(6),new Float32Array([0,1,.6,.4,.25,.15])));src.frequency.value=freq||110;const g=c.createGain();g.gain.value=.04;src.connect(g);g.connect(hp);src.start();}
  hp.connect(lp);lp.connect(an);const m=c.createGain();m.gain.value=0;an.connect(m);m.connect(c.destination);return {hp,lp,an,src};}
 // Full rebuild. getUserMedia + new AudioContext are both started synchronously (still inside the tap when called from one).
-async function rebuild(why){window.__rebuilds=(window.__rebuilds||0)+1;window.__micLastRecover=why;
- const AC=window.AudioContext||window.webkitAudioContext;const pending=isTest?null:askMic();const c=new AC();const rp=c.resume().catch(()=>{});
+async function rebuild(why,pre){window.__rebuilds=(window.__rebuilds||0)+1;window.__micLastRecover=why;
+ const AC=window.AudioContext||window.webkitAudioContext;const pending=isTest?null:askMic();const c=pre||new AC();const rp=c.resume().catch(()=>{});
  const oldCtx=ctx,oldSrc=source,freq=source&&source.frequency?source.frequency.value:null;
  try{const stream=pending?await timeout(pending,8000):null;if(stream==='timeout')throw new Error('gum timeout');await timeout(rp,3000);
   try{oldSrc&&oldSrc.mediaStream&&oldSrc.mediaStream.getTracks().forEach(t=>t.stop());}catch(_){}try{oldSrc&&oldSrc.stop&&oldSrc.stop();}catch(_){}try{oldCtx&&oldCtx.state!=='closed'&&oldCtx.close();}catch(_){}
@@ -286,8 +286,24 @@ async function ensureAudio(why,gesture=false){if(!running||busy||document.hidden
  }finally{busy=false;state();}}
 window.__micRecover=ensureAudio;
 // Every tap checks health first (pointerdown, capture). A tap while dozing is only used to wake the mic.
-document.addEventListener('pointerdown',()=>{if(running&&mic!=='needsTap')ensureAudio('tap',true);},true);
-document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();ensureAudio('tap',true);}},true);
+document.addEventListener('pointerdown',()=>{if(running&&mic!=='needsTap'&&!waking)ensureAudio('tap',true);},true);
+// v24: ONE tap always wakes a dozing ちゅな at once. Everything iOS needs from the gesture happens synchronously
+// right here (ctx.resume, a spare AudioContext, and getUserMedia if the track is already dead); the health
+// check + repair run afterwards in the background and never need another tap. Repeated taps are harmless.
+let waking=false;
+function wakeTap(){window.__wakeTaps=(window.__wakeTaps||0)+1;if(waking)return;waking=true;busy=true;
+ $('app').classList.remove('dozing');setMic('recovering');if(screen!=='start'){face('normal');hop($('jumper'));}
+ try{ctx.resume();}catch(_){}
+ const AC=window.AudioContext||window.webkitAudioContext;
+ const fix=(async()=>{
+  if(trackDead()||ctx.state==='closed')return rebuild('wake');            // getUserMedia + new context start synchronously inside rebuild()
+  const spare=new AC();spare.resume().catch(()=>{});                       // created inside the gesture, used only if needed
+  try{if(ctx.state!=='running')await timeout(ctx.resume(),900);}catch(_){}
+  if(ctx.state==='running'&&!trackDead()&&(!(await flatFor(700))||(reconnect()&&!(await flatFor(700))))){try{spare.close();}catch(_){}return true;}
+  return rebuild('wake',spare);})();
+ fix.then(ok=>ok?live():setMic('needsTap'),()=>setMic('needsTap')).finally(()=>{waking=false;busy=false;state();});}
+document.addEventListener('click',e=>{if(running&&mic==='needsTap'){wakeTap();if(screen!=='start'){e.stopPropagation();e.preventDefault();}}else if(running&&waking&&screen!=='start'){e.stopPropagation();e.preventDefault();}},true);
+window.__micDoze=()=>setMic('needsTap');
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>ensureAudio('visible'),50);});
 addEventListener('pageshow',()=>setTimeout(()=>ensureAudio('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>ensureAudio('focus'),50));
 // Watchdog (awake only): context/track health every 250 ms; exact-flat samples for >2 s => quiet recovery.
