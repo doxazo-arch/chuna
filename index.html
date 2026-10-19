@@ -17,7 +17,7 @@ function nearestString(f) {
 function yinAnalysis(buf, sampleRate) {
   let energy = 0;
   for (let i = 0; i < buf.length; i++) energy += buf[i] * buf[i];
-  if (Math.sqrt(energy / buf.length) < 0.002) return null;
+  if (Math.sqrt(energy / buf.length) < 0.0005) return null; // ~-66 dBFS: thin 1弦/2弦 plucks decay below -54 dBFS within ~1 s
   const min = Math.max(2, Math.floor(sampleRate / 400));
   const max = Math.min(Math.ceil(sampleRate / 65), Math.floor(buf.length / 2) - 1);
   if (max <= min) return null;
@@ -42,6 +42,15 @@ function yinAnalysis(buf, sampleRate) {
     let best = min;
     for (let lag = min + 1; lag <= max; lag++) if (cmnd[lag] < cmnd[best]) best = lag;
     if (cmnd[best] < 0.35) period = best; else return null;
+    // Sub-harmonic check: a period multiple (e.g. 1弦 329.6 Hz read as 110 or 82 Hz) also dips.
+    // Prefer the shortest divisor period whose dip is nearly as good.
+    for (const k of [4, 3, 2]) {
+      const c = Math.round(period / k);
+      if (c < min) continue;
+      let l = c;
+      for (let j = Math.max(min, c - 2); j <= Math.min(max, c + 2); j++) if (cmnd[j] < cmnd[l]) l = j;
+      if (cmnd[l] < Math.min(0.35, cmnd[period] + 0.08)) { period = l; break; }
+    }
   }
   const a = cmnd[period - 1], b = cmnd[period], c = cmnd[period + 1];
   const denominator = a - 2 * b + c;
@@ -63,7 +72,29 @@ function detectPitch(buf, sampleRate, prev) {
   if (prev > 0) candidates.sort((a,b) => Math.abs(cents(a.f,prev)) - Math.abs(cents(b.f,prev)));
   return candidates[0].f;
 }
-if (typeof window !== 'undefined') window.TunerCore = {yin, detectPitch, cents, nearestString};
+// Onset gate for auto string switching: only a fresh pluck (RMS jump) may switch strings, so
+// sympathetically ringing open strings (no attack) cannot steal the selection or be marked done.
+function onsetTracker() {
+  const hist = []; let lastOnset = -Infinity, used = -Infinity, note = null, votedFor = -Infinity, cand = null, count = 0;
+  return {
+    push(rms, now) {
+      hist.push({rms, now}); while (hist.length && now - hist[0].now > 350) hist.shift();
+      let floor = Infinity; for (const h of hist) if (now - h.now >= 60) floor = Math.min(floor, h.rms);
+      if (rms >= 0.0005 && (floor === Infinity ? true : rms > floor * 1.8)) lastOnset = now;
+      return lastOnset;
+    },
+    recent(now, ms = 500) { return lastOnset > used && now - lastOnset <= ms; }, // one auto switch per pluck
+    // Which string was actually plucked in the current note (first 3 agreeing detections after an onset).
+    vote(n) {
+      if (lastOnset > votedFor) { if (n === cand) count++; else { cand = n; count = 1; } if (count >= 3) { note = n; votedFor = lastOnset; } }
+      return note;
+    },
+    allows(sel) { return note === null || note === sel; },
+    clearNote() { note = null; votedFor = lastOnset; used = lastOnset; cand = null; count = 0; },
+    reset() { hist.length = 0; lastOnset = -Infinity; used = -Infinity; note = null; votedFor = -Infinity; cand = null; count = 0; }
+  };
+}
+if (typeof window !== 'undefined') window.TunerCore = {yin, detectPitch, cents, nearestString, onsetTracker};
 </script><script>
 const bodies=['<rect x="6" y="22" width="88" height="64" rx="32"/>','<rect x="14" y="18" width="72" height="68" rx="30" transform="rotate(-8 50 52)"/>','<circle cx="50" cy="52" r="40"/>','<path d="M50 10C76 10 90 40 90 60C90 80 72 92 50 92C28 92 10 80 10 60C10 40 24 10 50 10Z"/>','<path d="M38 12H62Q70 12 74 19L86 41Q90 48 86 55L74 77Q70 84 62 84H38Q30 84 26 77L14 55Q10 48 14 41L26 19Q30 12 38 12Z"/>','<rect x="16" y="26" width="68" height="54" rx="27"/>'];
 function shapes(i){const [x,z,y]=[[32,60,42],[36,58,40],[36,56,40],[36,56,50],[38,56,38],[38,54,40]][i];return `<g class="body">${bodies[i]}</g><g class="cheeks" fill="#FF8FB1" opacity=".55"><ellipse cx="${x-10}" cy="${y+16}" rx="7" ry="4.5"/><ellipse cx="${z+14}" cy="${y+16}" rx="7" ry="4.5"/></g><g class="eyes">${[x,z].map(a=>`<rect x="${a}" y="${y}" width="8" height="18" rx="4"/>`).join('')}</g><path class="smile" d="M${x} ${y+9}q4 -8 8 0 M${z} ${y+9}q4 -8 8 0"/><path class="sleep" d="M${x} ${y+9}h8 M${z} ${y+9}h8"/>`;}
@@ -76,7 +107,7 @@ const characters=[{size:1,angle:2,speed:2.6},{size:.95,angle:2.5,speed:2.2},{siz
 function character(index){const c=characters[index];$('buddy').dataset.character=index;$('buddy').innerHTML=shapes(index);$('buddy').style.setProperty('--sway-angle',`${c.angle}deg`);$('buddy').style.setProperty('--sway-speed',`${c.speed}s`);$('buddy').style.setProperty('--size',c.size);$('jumper').style.setProperty('--hop-height',index===5?'calc(-.104 * var(--u))':'calc(-.08 * var(--u))');}
 let ctx,analyser,source,highpass,lowpass,wakeLock,starting=false,running=false;
 let screen='start',selected=0,completed=new Set(),samples=[],smooth=null,smoothTime=0,previous=null,lastDetection=-Infinity,lastSignal=0,holdSince=null,inTune=false,allDone=false,finishTimer;
-const buffer=new Float32Array(4096),auto=params.get('test')==='1'&&params.get('auto')==='1';
+const onsets=onsetTracker();const buffer=new Float32Array(4096),auto=params.get('test')==='1'&&params.get('auto')==='1';
 function expose(){window.__tunerState={screen,stringIndex:selected,done:Array.from({length:6},(_,i)=>completed.has(i)),inTune};}
 function show(name){screen=name;$('app').classList.toggle('active',name==='tuning'||name==='done');$('app').classList.toggle('denied',name==='error');$('app').classList.toggle('all-done',name==='done');if(name!=='done')$('app').classList.remove('restart-ready');$('start').hidden=name!=='start'&&name!=='error';$('error').hidden=name!=='error';expose();}
 function button(visible,restart=false){if(restart)$('app').classList.add('restart-ready');}
@@ -86,7 +117,7 @@ function render(){character(selected);$('app').style.setProperty('--color',strin
 function hop(el,cls='hop'){el.classList.remove(cls);void el.getBoundingClientRect();el.classList.add(cls);}
 function popNote(color,delay=0,left=36){const n=document.createElementNS('http://www.w3.org/2000/svg','svg');n.setAttribute('viewBox','0 0 16 20');n.setAttribute('class','note');n.style.cssText=`left:calc(50% + ${left}px);top:0;animation-delay:${delay}ms`;n.innerHTML=`<g fill="${color}"><ellipse cx="6" cy="15" rx="6" ry="4" transform="rotate(-20 6 15)"/><path d="M11 15V1h2q0 3 3 5v4q-1-3-3-4v9z"/></g>`;(allDone?$('meter'):$('mover')).append(n);setTimeout(()=>n.remove(),delay+1000);}
 function reset(){samples=[];smooth=null;previous=null;smoothTime=0;lastDetection=-Infinity;holdSince=null;inTune=false;window.__otherCount=0;window.__otherString=null;face('normal');$('buddy').classList.remove('sway','breathing');visual(0,true);$('mover').style.transform='translateX(0px)';}
-function select(i){if(selected!==i){const ghost=$('buddy').cloneNode(true);ghost.removeAttribute('id');ghost.classList.add('departing');$('jumper').append(ghost);setTimeout(()=>ghost.remove(),150);hop($('jumper'),'arrive');}selected=Math.max(0,Math.min(5,i));reset();inTune=completed.has(selected);window.__ignoreUntil=performance.now()+250;lastSignal=performance.now();if(auto&&source?.frequency)source.frequency.setValueAtTime(STRING_FREQUENCIES[selected],ctx.currentTime);show('tuning');render();if(inTune)face('happy');}
+function select(i){if(selected!==i){const ghost=$('buddy').cloneNode(true);ghost.removeAttribute('id');ghost.classList.add('departing');$('jumper').append(ghost);setTimeout(()=>ghost.remove(),150);hop($('jumper'),'arrive');}selected=Math.max(0,Math.min(5,i));reset();onsets.clearNote();inTune=completed.has(selected);window.__ignoreUntil=performance.now()+250;lastSignal=performance.now();if(auto&&source?.frequency)source.frequency.setValueAtTime(STRING_FREQUENCIES[selected],ctx.currentTime);show('tuning');render();if(inTune)face('happy');}
 function finish(){allDone=true;show('done');render();face('happy');visual(0,true);const pegs=[...document.querySelectorAll('.peg')];pegs.forEach((p,i)=>{const from=p.getBoundingClientRect();p.classList.add('parade');p.style.setProperty('--order',i);const to=p.getBoundingClientRect();if(!reduced)p.animate([{transform:`translate(${from.x-to.x}px,${from.y-to.y}px)`},{transform:'translate(0,0)'}],{duration:450,easing:'cubic-bezier(.22,1,.36,1)'});for(let lap=0;lap<2;lap++)setTimeout(()=>hop(p.querySelector('.peg-motion'),'peg-hop'),450+lap*700+i*100);popNote(stringColors[i],i*100,-100+i*32);});clearTimeout(finishTimer);finishTimer=setTimeout(()=>{if(allDone)button(true,true);},1500);}
 async function requestWakeLock(){if(!navigator.wakeLock||document.visibilityState!=='visible')return;try{if(!wakeLock||wakeLock.released)wakeLock=await navigator.wakeLock.request('screen');}catch(_){}}
 async function start(){if(running){ctx.resume();select(0);requestWakeLock();return;}if(starting)return;starting=true;$('start').classList.add('waking');hop($('sleeper'),'wake-hop');$('error').hidden=true;
@@ -104,15 +135,15 @@ async function start(){if(running){ctx.resume();select(0);requestWakeLock();retu
  }catch(_){if(source?.mediaStream)source.mediaStream.getTracks().forEach(track=>track.stop());if(ctx)try{await ctx.close();}catch(_){}show('error');face('sleepy');$('buddy').classList.remove('breathing','sway');$('error').hidden=false;}finally{starting=false;$('start').disabled=false;$('start').classList.remove('waking');}}
 
 function analyze(){if(!running)return;const now=performance.now();if(ctx.state!=='running'||document.hidden){holdSince=null;return;}
- analyser.getFloatTimeDomainData(buffer);let energy=0;for(const v of buffer)energy+=v*v;if(Math.sqrt(energy/buffer.length)>=.002)lastSignal=now;const silent=now-lastSignal>=2000;
+ analyser.getFloatTimeDomainData(buffer);let energy=0;for(const v of buffer)energy+=v*v;onsets.push(Math.sqrt(energy/buffer.length),now);if(Math.sqrt(energy/buffer.length)>=.0005)lastSignal=now;const silent=now-lastSignal>=2000;
  if(now<(window.__ignoreUntil||0)){previous=null;return;}
  const frequency=detectPitch(buffer,ctx.sampleRate,previous);
  if(frequency===null){holdSince=null;if(now-lastDetection>250)previous=null;if(silent&&!allDone){smooth=null;$('mover').style.transform='translateX(0px)';visual(0,true);$('buddy').classList.remove('sway');face('sleepy');visual(0,true);document.querySelectorAll('.peg-motion').forEach(p=>p.classList.remove('sway'));}return;}
- previous=frequency;const value=cents(frequency,STRING_FREQUENCIES[selected]),nearest=nearestString(frequency);
- if(nearest!==selected&&Math.abs(value)>80){window.__otherCount=(window.__otherString===nearest?(window.__otherCount||0):0)+1;window.__otherString=nearest;if(window.__otherCount>=4)select(nearest);return;}window.__otherCount=0;window.__otherString=null;
+ previous=frequency;const value=cents(frequency,STRING_FREQUENCIES[selected]),nearest=nearestString(frequency);onsets.vote(nearest);
+ if(nearest!==selected&&Math.abs(value)>80){if(!onsets.recent(now)){window.__otherCount=0;window.__otherString=null;return;}window.__otherCount=(window.__otherString===nearest?(window.__otherCount||0):0)+1;window.__otherString=nearest;if(window.__otherCount>=4)select(nearest);return;}window.__otherCount=0;window.__otherString=null;
  samples.push(value);if(samples.length>3)samples.shift();const median=[...samples].sort((a,b)=>a-b)[Math.floor(samples.length/2)];smooth=smooth===null||now-lastDetection>300?median:smooth+(1-Math.exp(-(now-smoothTime)/150))*(median-smooth);smoothTime=now;lastDetection=now;
  if(Math.abs(smooth)>8){if(completed.has(selected)){completed.delete(selected);allDone=false;clearTimeout(finishTimer);show('tuning');render();}inTune=false;holdSince=null;}
- if(!inTune){if(Math.abs(smooth)<=5){if(holdSince===null)holdSince=now;if(now-holdSince>=500){inTune=true;completed.add(selected);render();hop($('jumper'));const tunedPeg=document.querySelector('.peg.current .peg-motion');if(tunedPeg)hop(tunedPeg,'peg-hop');document.querySelectorAll('.dot').forEach((d,i)=>{d.style.animationDelay=`${Math.abs(i-5)*40}ms`;hop(d,'ripple');});if(completed.size===6){finish();return;}popNote(stringColors[selected],120);}}else holdSince=null;}
+ if(!inTune){if(Math.abs(smooth)<=5&&onsets.allows(selected)){if(holdSince===null)holdSince=now;if(now-holdSince>=500){inTune=true;completed.add(selected);render();hop($('jumper'));const tunedPeg=document.querySelector('.peg.current .peg-motion');if(tunedPeg)hop(tunedPeg,'peg-hop');document.querySelectorAll('.dot').forEach((d,i)=>{d.style.animationDelay=`${Math.abs(i-5)*40}ms`;hop(d,'ripple');});if(completed.size===6){finish();return;}popNote(stringColors[selected],120);}}else holdSince=null;}
  if(allDone){face('happy');expose();return;}
  face(inTune?'happy':'normal');$('buddy').classList.toggle('sway',!inTune);const peg=document.querySelector('.peg.current .peg-motion');if(peg)peg.classList.toggle('sway',!inTune);
  visual(smooth,false);expose();
@@ -133,4 +164,40 @@ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
 function arrival(){const sources=[$('sleeper'),...document.querySelectorAll('.sibling')].map(e=>e.getBoundingClientRect());setTimeout(()=>{document.querySelectorAll('.peg').forEach((p,i)=>{const from=sources[i],to=p.getBoundingClientRect();if(!reduced)p.animate([{transform:`translate(${from.x+from.width/2-to.x-to.width/2}px,${from.y+from.height/2-to.y-to.height/2}px) scale(${from.width/to.width})`},{transform:'translate(0,0) scale(1)'}],{duration:450,delay:i*80,easing:'cubic-bezier(.22,1,.36,1)',fill:'backwards'});});},0);}
 function drawStrings(t){if(running&&!allDone){const energy=Math.sqrt(buffer.reduce((a,v)=>a+v*v,0)/buffer.length),low=$('app').classList.contains('low'),high=$('app').classList.contains('high');const i=selected,left=i<3,y=510-(left?i:5-i)*170,x=left?355:645,end=400+i*40,p=$('wire-'+i);if(p){const amp=reduced?0:low?12*Math.sin(t/1600*Math.PI*2):high?4*Math.sin(t/120*Math.PI*2):0;p.setAttribute('d',`M${x} ${y} C${x+amp} ${y+(638-y)/3} ${end-amp} ${y+2*(638-y)/3} ${end} 638`);p.style.opacity=.6+Math.min(.4,energy*20);}const peg=document.querySelector('.peg.current .peg-motion');if(peg&&!reduced)peg.style.transform=`translateY(${-Math.abs(Math.sin(t/60))*Math.min(.01*unit(),energy*unit())}px)`;}requestAnimationFrame(drawStrings);}
 function blinkLater(i){setTimeout(()=>{const p=document.querySelector(`[data-string="${i}"]:not(.done)`);if(p)hop(p.querySelector('svg'),'face-switch');blinkLater(i);},6000+Math.random()*4000);}characters.forEach((_,i)=>blinkLater(i));
-</script></body></html>
+</script><style>.dozing #buddy{animation:breathe 3.2s ease-in-out infinite;transform-origin:50% 86%}.doze-bubble{position:absolute;right:8%;top:6%;width:calc(var(--u)*.06);height:calc(var(--u)*.06);border-radius:50%;background:#F5F5F5;opacity:0;pointer-events:none;transform-origin:30% 70%}.dozing .doze-bubble{opacity:.9;animation:dozeb 3.2s ease-in-out infinite}@keyframes dozeb{50%{transform:scale(2.2)}}@media(prefers-reduced-motion:reduce){.dozing #buddy,.dozing .doze-bubble{animation:none}}</style>
+<script id="mic-recovery">
+// Mic recovery: iOS Safari can suspend/interrupt the AudioContext or end/mute the mic track
+// (screen lock, background, calls, Siri, other apps, long idle). Recover silently; if iOS needs a gesture, doze and wake on any tap.
+(()=>{let mic='idle',recovering=false,flatSince=null,watchedCtx=null,watchedTrack=null;const probe=new Float32Array(1024);
+const isTest=params.get('test')==='1';
+function track(){return source&&source.mediaStream?source.mediaStream.getAudioTracks()[0]:null;}
+function setMic(m){mic=m;window.__micState={mic,ctx:ctx?ctx.state:null,track:track()?track().readyState:null,muted:track()?track().muted:null};$('app').classList.toggle('dozing',m==='needsTap');if(m==='needsTap'){face('sleepy');$('buddy').classList.remove('sway');}}
+function bubble(){if(!document.querySelector('.doze-bubble')){const b=document.createElement('div');b.className='doze-bubble';$('jumper').append(b);}}
+function watch(){if(ctx&&watchedCtx!==ctx){watchedCtx=ctx;ctx.addEventListener('statechange',()=>{if(running&&ctx.state!=='running'&&!document.hidden)recover('statechange');});}
+ const t=track();if(t&&watchedTrack!==t){watchedTrack=t;t.addEventListener('ended',()=>recover('ended'));t.addEventListener('mute',()=>setTimeout(()=>{if(t.muted)recover('mute');},1500));}}
+const timeout=(p,ms)=>Promise.race([p,new Promise(r=>setTimeout(()=>r('timeout'),ms))]);
+async function newStream(){const old=source;const s=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+ try{old.mediaStream.getTracks().forEach(t=>t.stop());old.disconnect();}catch(_){}source=ctx.createMediaStreamSource(s);source.connect(highpass);flatSince=null;watch();}
+async function recover(why,gesture){if(!running||recovering||document.hidden)return;recovering=true;setMic('recovering');window.__micLastRecover=why;
+ try{if(ctx.state!=='running'){await timeout(ctx.resume().catch(()=>{}),gesture?3000:800);}
+  const t=track();if(!isTest&&ctx.state==='running'&&(!t||t.readyState!=='live'||t.muted||why==='flat')){try{await newStream();}catch(_){}}
+  const t2=track();const ok=ctx.state==='running'&&(isTest||(t2&&t2.readyState==='live'));
+  if(ok){const was=mic==='needsTap'||$('app').classList.contains('dozing');setMic('live');lastSignal=performance.now();requestWakeLock();if(was){face('normal');hop($('jumper'));}}
+  else setMic('needsTap');}
+ finally{recovering=false;}}
+window.__micRecover=recover;
+// Any tap while dozing reconnects inside the gesture (resume must be called synchronously in the tap).
+document.addEventListener('pointerdown',e=>{if(!running)return;if(ctx&&ctx.state!=='running')ctx.resume().catch(()=>{});
+ if(mic==='needsTap'){e.preventDefault();e.stopPropagation();recover('tap',true);}},true);
+document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();}},true);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>recover('visible'),50);});
+addEventListener('pageshow',()=>setTimeout(()=>recover('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>recover('focus'),50));
+// Watchdog: context not running, track not live/muted, or analyser input exactly flat for 3 s while the track claims live.
+setInterval(()=>{if(!running||document.hidden)return;bubble();watch();if(mic==='needsTap')return;if(mic==='idle')setMic('live');
+ const t=track();if(ctx.state!=='running'||(!isTest&&(!t||t.readyState!=='live'))){recover('watchdog');return;}
+ analyser.getFloatTimeDomainData(probe);let flat=true;for(let i=1;i<probe.length;i++)if(probe[i]!==probe[0]){flat=false;break;}
+ const now=performance.now();if(flat){if(flatSince===null)flatSince=now;else if(now-flatSince>3000){flatSince=null;recover('flat');}}else flatSince=null;
+ window.__micState={mic,ctx:ctx.state,track:t?t.readyState:null,muted:t?t.muted:null};},1000);
+})();
+</script>
+</body></html>
