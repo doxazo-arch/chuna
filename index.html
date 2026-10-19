@@ -59,9 +59,44 @@ function yinAnalysis(buf, sampleRate) {
   return frequency >= 65 && frequency <= 400 ? {frequency, cmnd} : null;
 }
 function yin(buf, sampleRate) { return yinAnalysis(buf, sampleRate)?.frequency ?? null; }
+// Peak power of a band around f (±60c) using Hann-windowed Goertzel probes.
+let hannCache = null;
+function bandPower(buf, sampleRate, f) {
+  let best = 0; const n = buf.length;
+  if (!hannCache || hannCache.length !== n) { hannCache = new Float32Array(n); for (let i = 0; i < n; i++) hannCache[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1)); }
+  const win = hannCache;
+  for (let p = -3; p <= 3; p++) {
+    const w = 2 * Math.PI * f * 2 ** (p * 20 / 1200) / sampleRate, k = 2 * Math.cos(w);
+    let s1 = 0, s2 = 0;
+    for (let i = 0; i < n; i++) { const s = buf[i] * win[i] + k * s1 - s2; s2 = s1; s1 = s; }
+    best = Math.max(best, s1 * s1 + s2 * s2 - k * s1 * s2);
+  }
+  return best;
+}
+// Two strings ringing at once (e.g. 1弦 plucked while open 4/5弦 ring along): their periods don't nest
+// (329.6/146.8 = 2.245), so YIN can latch onto the quieter low string's longer period. If another string's
+// fundamental is clearly louder, is not a harmonic of the detected pitch, and has its own YIN dip, report it.
+function resolveMixture(buf, sampleRate, f, cmnd) {
+  const pf = bandPower(buf, sampleRate, f); let best = null;
+  for (let i = 0; i < 6; i++) {
+    const g = STRING_FREQUENCIES[i]; if (g <= f * 1.09) continue;
+    const r = g / f, k = Math.round(r), harmonic = Math.abs(1200 * Math.log2(r / k)) < 60;
+    const pw = bandPower(buf, sampleRate, g); if (pw < pf * (harmonic ? 8 : 3) || (best && pw <= best.pw)) continue;
+    // g sits on a harmonic of f (1弦 = 3rd of 5弦): only a lone loud partial counts, not a rich low-string pluck.
+    if (harmonic && k !== 2 && pw < 4 * bandPower(buf, sampleRate, 2 * f)) continue;
+    const lo = Math.max(2, Math.floor(sampleRate / (g * 1.035))), hi = Math.min(cmnd.length - 2, Math.ceil(sampleRate / (g / 1.035)));
+    let l = lo; for (let j = lo; j <= hi; j++) if (cmnd[j] < cmnd[l]) l = j;
+    if (l <= lo || l >= hi || cmnd[l] > 0.6) continue;
+    const a = cmnd[l - 1], b = cmnd[l], c = cmnd[l + 1], d = a - 2 * b + c;
+    best = {pw, f: sampleRate / (l + (d ? Math.max(-1, Math.min(1, (a - c) / (2 * d))) : 0))};
+  }
+  return best ? best.f : f;
+}
 function detectPitch(buf, sampleRate, prev) {
   const result = yinAnalysis(buf, sampleRate);
   if (!result) return null;
+  const mixed = resolveMixture(buf, sampleRate, result.frequency, result.cmnd);
+  if (mixed !== result.frequency) return mixed;
   const candidates = [result.frequency, result.frequency / 2, result.frequency * 2]
     .filter(f => f >= 65 && f <= 400)
     .map(f => ({f, consistency: result.cmnd[Math.round(sampleRate / f)] ?? 1}))
@@ -71,6 +106,11 @@ function detectPitch(buf, sampleRate, prev) {
   // then resolves equally plausible fundamentals in a harmonic-rich pluck.
   if (prev > 0) candidates.sort((a,b) => Math.abs(cents(a.f,prev)) - Math.abs(cents(b.f,prev)));
   return candidates[0].f;
+}
+// Attack frames are noisy: only switch away from the selected string when the candidate's fundamental
+// is not clearly quieter than the selected string's own fundamental (if the selected string is the one sounding, stay).
+function switchAllowed(buf, sampleRate, cand, sel) {
+  return bandPower(buf, sampleRate, STRING_FREQUENCIES[cand]) > 0.25 * bandPower(buf, sampleRate, STRING_FREQUENCIES[sel]);
 }
 // Onset gate for auto string switching: only a fresh pluck (RMS jump) may switch strings, so
 // sympathetically ringing open strings (no attack) cannot steal the selection or be marked done.
@@ -89,12 +129,13 @@ function onsetTracker() {
       if (lastOnset > votedFor) { if (n === cand) count++; else { cand = n; count = 1; } if (count >= 3) { note = n; votedFor = lastOnset; } }
       return note;
     },
+    since(now) { return now - lastOnset; },
     allows(sel) { return note === null || note === sel; },
     clearNote() { note = null; votedFor = lastOnset; used = lastOnset; cand = null; count = 0; },
     reset() { hist.length = 0; lastOnset = -Infinity; used = -Infinity; note = null; votedFor = -Infinity; cand = null; count = 0; }
   };
 }
-if (typeof window !== 'undefined') window.TunerCore = {yin, detectPitch, cents, nearestString, onsetTracker};
+if (typeof window !== 'undefined') window.TunerCore = {yin, detectPitch, bandPower, switchAllowed, cents, nearestString, onsetTracker};
 </script><script>
 const bodies=['<rect x="6" y="22" width="88" height="64" rx="32"/>','<rect x="14" y="18" width="72" height="68" rx="30" transform="rotate(-8 50 52)"/>','<circle cx="50" cy="52" r="40"/>','<path d="M50 10C76 10 90 40 90 60C90 80 72 92 50 92C28 92 10 80 10 60C10 40 24 10 50 10Z"/>','<path d="M38 12H62Q70 12 74 19L86 41Q90 48 86 55L74 77Q70 84 62 84H38Q30 84 26 77L14 55Q10 48 14 41L26 19Q30 12 38 12Z"/>','<rect x="16" y="26" width="68" height="54" rx="27"/>'];
 function shapes(i){const [x,z,y]=[[32,60,42],[36,58,40],[36,56,40],[36,56,50],[38,56,38],[38,54,40]][i];return `<g class="body">${bodies[i]}</g><g class="cheeks" fill="#FF8FB1" opacity=".55"><ellipse cx="${x-10}" cy="${y+16}" rx="7" ry="4.5"/><ellipse cx="${z+14}" cy="${y+16}" rx="7" ry="4.5"/></g><g class="eyes">${[x,z].map(a=>`<rect x="${a}" y="${y}" width="8" height="18" rx="4"/>`).join('')}</g><path class="smile" d="M${x} ${y+9}q4 -8 8 0 M${z} ${y+9}q4 -8 8 0"/><path class="sleep" d="M${x} ${y+9}h8 M${z} ${y+9}h8"/>`;}
@@ -118,7 +159,7 @@ function hop(el,cls='hop'){el.classList.remove(cls);void el.getBoundingClientRec
 function popNote(color,delay=0,left=36){const n=document.createElementNS('http://www.w3.org/2000/svg','svg');n.setAttribute('viewBox','0 0 16 20');n.setAttribute('class','note');n.style.cssText=`left:calc(50% + ${left}px);top:0;animation-delay:${delay}ms`;n.innerHTML=`<g fill="${color}"><ellipse cx="6" cy="15" rx="6" ry="4" transform="rotate(-20 6 15)"/><path d="M11 15V1h2q0 3 3 5v4q-1-3-3-4v9z"/></g>`;(allDone?$('meter'):$('mover')).append(n);setTimeout(()=>n.remove(),delay+1000);}
 function reset(){samples=[];smooth=null;previous=null;smoothTime=0;lastDetection=-Infinity;holdSince=null;inTune=false;window.__otherCount=0;window.__otherString=null;face('normal');$('buddy').classList.remove('sway','breathing');visual(0,true);$('mover').style.transform='translateX(0px)';}
 function select(i){if(selected!==i){const ghost=$('buddy').cloneNode(true);ghost.removeAttribute('id');ghost.classList.add('departing');$('jumper').append(ghost);setTimeout(()=>ghost.remove(),150);hop($('jumper'),'arrive');}selected=Math.max(0,Math.min(5,i));reset();onsets.clearNote();inTune=completed.has(selected);window.__ignoreUntil=performance.now()+250;lastSignal=performance.now();if(auto&&source?.frequency)source.frequency.setValueAtTime(STRING_FREQUENCIES[selected],ctx.currentTime);show('tuning');render();if(inTune)face('happy');}
-function finish(){allDone=true;show('done');render();face('happy');visual(0,true);const pegs=[...document.querySelectorAll('.peg')];pegs.forEach((p,i)=>{const from=p.getBoundingClientRect();p.classList.add('parade');p.style.setProperty('--order',i);const to=p.getBoundingClientRect();if(!reduced)p.animate([{transform:`translate(${from.x-to.x}px,${from.y-to.y}px)`},{transform:'translate(0,0)'}],{duration:450,easing:'cubic-bezier(.22,1,.36,1)'});setTimeout(()=>hop(p.querySelector('.peg-motion'),'peg-hop'),450+(5-i)*90);popNote(stringColors[i],i*100,-100+i*32);});clearTimeout(finishTimer);finishTimer=setTimeout(()=>{if(allDone)button(true,true);},1500);}
+function finish(){allDone=true;show('done');render();face('happy');visual(0,true);if(window.__celebrate){window.__celebrate();return;}const pegs=[...document.querySelectorAll('.peg')];pegs.forEach((p,i)=>{p.classList.add('parade');p.style.setProperty('--order',i);});clearTimeout(finishTimer);finishTimer=setTimeout(()=>{if(allDone)button(true,true);},1500);}
 async function requestWakeLock(){if(!navigator.wakeLock||document.visibilityState!=='visible')return;try{if(!wakeLock||wakeLock.released)wakeLock=await navigator.wakeLock.request('screen');}catch(_){}}
 async function start(){if(running){ctx.resume();select(0);requestWakeLock();return;}if(starting)return;starting=true;window.__tapAt=performance.now();$('start').classList.add('waking');$('sleeper').classList.remove('sleepy');hop($('sleeper'),'wake-hop');$('error').hidden=true;
  try{
@@ -140,7 +181,7 @@ function analyze(){if(!running)return;const now=performance.now();if(ctx.state!=
  const frequency=detectPitch(buffer,ctx.sampleRate,previous);
  if(frequency!==null)$('app').classList.remove('waiting');if(frequency===null){holdSince=null;if(now-lastDetection>250)previous=null;if(silent&&!allDone){smooth=null;$('mover').style.transform='translateX(0px)';visual(0,true);$('buddy').classList.remove('sway');if(!$('app').classList.contains('dozing'))face('normal');$('app').classList.add('waiting');visual(0,true);document.querySelectorAll('.peg-motion').forEach(p=>p.classList.remove('sway'));}return;}
  previous=frequency;const value=cents(frequency,STRING_FREQUENCIES[selected]),nearest=nearestString(frequency);onsets.vote(nearest);
- if(nearest!==selected&&Math.abs(value)>80){if(!onsets.recent(now)){window.__otherCount=0;window.__otherString=null;return;}window.__otherCount=(window.__otherString===nearest?(window.__otherCount||0):0)+1;window.__otherString=nearest;if(window.__otherCount>=4)select(nearest);return;}window.__otherCount=0;window.__otherString=null;
+ if(nearest!==selected&&Math.abs(value)>80){if(!onsets.recent(now)||!switchAllowed(buffer,ctx.sampleRate,nearest,selected)){window.__otherCount=0;window.__otherString=null;return;}if(window.__otherString!==nearest){window.__otherString=nearest;window.__otherSince=now;window.__otherCount=0;}window.__otherCount++;if(window.__otherCount>=4&&now-window.__otherSince>=150)select(nearest);return;}window.__otherCount=0;window.__otherString=null;
  samples.push(value);if(samples.length>3)samples.shift();const median=[...samples].sort((a,b)=>a-b)[Math.floor(samples.length/2)];smooth=smooth===null||now-lastDetection>300?median:smooth+(1-Math.exp(-(now-smoothTime)/150))*(median-smooth);smoothTime=now;lastDetection=now;
  if(Math.abs(smooth)>8){if(completed.has(selected)){completed.delete(selected);allDone=false;clearTimeout(finishTimer);show('tuning');render();}inTune=false;holdSince=null;}
  if(!inTune){if(Math.abs(smooth)<=5&&onsets.allows(selected)){if(holdSince===null)holdSince=now;if(now-holdSince>=500){inTune=true;completed.add(selected);render();if(window.__tunedHop)__tunedHop();else hop($('jumper'));const tunedPeg=document.querySelector('.peg.current .peg-motion');if(tunedPeg)hop(tunedPeg,'peg-hop');document.querySelectorAll('.dot').forEach((d,i)=>{d.style.animationDelay=`${Math.abs(i-5)*40}ms`;hop(d,'ripple');});if(completed.size===6){finish();return;}popNote(stringColors[selected],120);}}else holdSince=null;}
@@ -196,8 +237,8 @@ async function newStream(pending){const old=source;const s=await pending;
  try{old.mediaStream.getTracks().forEach(t=>t.stop());old.disconnect();}catch(_){}source=ctx.createMediaStreamSource(s);source.connect(highpass);flatSince=null;watch();}
 async function recover(why,gesture){if(!running||recovering||document.hidden)return;
  // A dead mic track is only re-requested inside a user tap (getUserMedia called synchronously here, before any await).
- const dead=!isTest&&track()&&track().readyState==='ended';if(dead&&!gesture){setMic('needsTap');window.__micLastRecover=why;return;}
- const pending=dead?askMic():null;recovering=true;setMic('recovering');window.__micLastRecover=why;
+ const dead=!isTest&&track()&&(track().readyState==='ended'||(why==='mute'&&track().muted));if(dead&&!gesture){setMic('needsTap');window.__micLastRecover=why;return;}
+ const pending=dead&&gesture?askMic():null;recovering=true;setMic('recovering');window.__micLastRecover=why;
  try{if(ctx.state!=='running'){await timeout(ctx.resume().catch(()=>{}),gesture?3000:800);}
   const t=track();if(pending){try{await newStream(pending);}catch(_){}} // re-ask the mic ONLY for a truly dead track (each getUserMedia can show the iOS dialog)
   const t2=track();const ok=ctx.state==='running'&&(isTest||(t2&&t2.readyState==='live'));
@@ -205,10 +246,31 @@ async function recover(why,gesture){if(!running||recovering||document.hidden)ret
   else setMic('needsTap');}
  finally{recovering=false;}}
 window.__micRecover=recover;
+// Wake tap from doze: if anything is off (track ended/muted, context not running), rebuild everything
+// inside the gesture: fresh getUserMedia + fresh AudioContext (both started synchronously), new graph, old ones closed.
+function needsRebuild(){const t=track();return ctx.state!=='running'||(!isTest&&(!t||t.readyState!=='live'||t.muted));}
+function graph(c,stream,freq){const hp=c.createBiquadFilter();hp.type='highpass';hp.frequency.value=30;const lp=c.createBiquadFilter();lp.type='lowpass';lp.frequency.value=1000;const an=c.createAnalyser();an.fftSize=4096;let src;
+ if(stream){src=c.createMediaStreamSource(stream);src.connect(hp);}else{src=c.createOscillator();src.setPeriodicWave(c.createPeriodicWave(new Float32Array(6),new Float32Array([0,1,.6,.4,.25,.15])));src.frequency.value=freq||110;const g=c.createGain();g.gain.value=.04;src.connect(g);g.connect(hp);src.start();}
+ hp.connect(lp);lp.connect(an);const m=c.createGain();m.gain.value=0;an.connect(m);m.connect(c.destination);return {hp,lp,an,src};}
+function signalFlowing(){const b=new Float32Array(2048);analyser.getFloatTimeDomainData(b);let e=0;for(const v of b)e+=v*v;return Math.sqrt(e/b.length)>1e-7;}
+async function rebuild(why,attempt=0){if(recovering)return;recovering=true;setMic('recovering');window.__micLastRecover=why;window.__rebuilds=(window.__rebuilds||0)+1;
+ const AC=window.AudioContext||window.webkitAudioContext;const pending=isTest?null:askMic();const c=new AC();const rp=c.resume().catch(()=>{});
+ const oldCtx=ctx,oldSrc=source,freq=source&&source.frequency?source.frequency.value:null;
+ try{const stream=pending?await timeout(pending,8000):null;if(stream==='timeout')throw new Error('gum timeout');await timeout(rp,3000);
+  try{oldSrc&&oldSrc.mediaStream&&oldSrc.mediaStream.getTracks().forEach(t=>t.stop());}catch(_){}try{oldSrc&&oldSrc.stop&&oldSrc.stop();}catch(_){}try{oldCtx&&oldCtx.close();}catch(_){}
+  const g=graph(c,stream,freq);ctx=c;highpass=g.hp;lowpass=g.lp;analyser=g.an;source=g.src;flatSince=null;watch();
+  holdSince=null;previous=null;lastSignal=performance.now();
+  await new Promise(r=>setTimeout(r,ctx.state==='running'?600:0));
+  const ok=ctx.state==='running'&&(isTest||track()&&track().readyState==='live')&&signalFlowing();
+  if(ok){setMic('live');requestWakeLock();face('normal');hop($('jumper'));}
+  else if(attempt===0&&ctx.state!=='running'){recovering=false;try{await ctx.resume();}catch(_){}if(ctx.state==='running'&&signalFlowing()){setMic('live');face('normal');}else setMic('needsTap');return;}
+  else setMic(signalFlowing()?'live':'needsTap');
+ }catch(_){try{c.close();}catch(__){}setMic('needsTap');}finally{recovering=false;}}
+window.__micRebuild=rebuild;
 // Any tap while dozing reconnects inside the gesture (resume must be called synchronously in the tap).
 document.addEventListener('pointerdown',e=>{if(!running)return;if(ctx&&ctx.state!=='running')ctx.resume().catch(()=>{});
  },true);
-document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();recover('tap',true);}},true);
+document.addEventListener('click',e=>{if(running&&mic==='needsTap'){e.stopPropagation();e.preventDefault();if(needsRebuild())rebuild('tap');else recover('tap',true);}},true);
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>recover('visible'),50);});
 addEventListener('pageshow',()=>setTimeout(()=>recover('pageshow'),50));addEventListener('focus',()=>setTimeout(()=>recover('focus'),50));
 // Watchdog: context not running, track not live/muted, or analyser input exactly flat for 3 s while the track claims live.
@@ -223,7 +285,14 @@ setInterval(()=>{if(!running||document.hidden)return;bubble();watch();if(mic==='
 #buddy.breath{animation:breathe2 var(--breath,3.3s) cubic-bezier(.45,0,.55,1) infinite;transform-origin:50% 86%}.content #buddy.breath{animation-duration:calc(var(--breath,3.3s)*1.5)}
 @keyframes breathe2{50%{transform:scale(calc(1.03*var(--size,1)),calc(.97*var(--size,1)))}0%,100%{transform:scale(var(--size,1))}}
 @media(prefers-reduced-motion:reduce){#buddy.breath{animation:none}}</style>
-<script id="motion">
+<style>
+/* v19 all-done family celebration */
+.all-done .dot,.all-done #foot,.all-done .mover,.all-done .note{opacity:0!important;transition:opacity 200ms}
+.all-done .head-face,.all-done .neck,.all-done .nut,.all-done .wires rect,.all-done .wires circle{opacity:.4;transition:opacity 400ms}
+.peg.parade{left:calc(50% + (var(--order) - 2.5) * var(--u) * .115)!important;top:calc(100% + var(--u)*.48 + var(--arch,0px))!important;z-index:calc(10 - var(--order))}
+.peg.awake-one .eyes{display:block}.peg.awake-one .smile{display:none}
+.sparkle{position:absolute;left:50%;top:-6%;width:12px;height:12px;margin-left:-6px;pointer-events:none}
+</style><script id="motion">
 // v18 lovable motion (Kaito spec): irregular idles, eyes lead/body follows, onset "ha!", lean on meter (x stays pitch-only),
 // tuned hop + water settle + blush, siblings watch/cheer/sync, peg squish, cheerful reset, reduced-motion = face changes only.
 (()=>{const R=(a,b)=>a+Math.random()*(b-a),E='cubic-bezier(.22,1,.36,1)',app=$('app'),log=window.__motionLog=[];
@@ -249,6 +318,29 @@ window.__tunedHop=()=>{log.push({k:'tuned',t:now()});const j=$('jumper'),h=-.06*
  if(!reduced)anim(j,[{scale:'1 1',translate:'0 0'},{scale:'1.1 .9',translate:'0 0',offset:80/940},{scale:'.94 1.06',translate:`0 ${h}px`,offset:300/940,easing:'cubic-bezier(.4,0,1,1)'},{scale:'1 1',translate:'0 0',offset:500/940},{scale:'1.12 .88',translate:'0 0',offset:580/940},{scale:'.96 1.04',offset:700/940},{scale:'1.03 .97',offset:820/940},{scale:'1 1',translate:'0 0'}],{duration:940,easing:'ease-out'});
  const land=reduced?0:580;setTimeout(()=>{const c=$('buddy').querySelector('.cheeks');anim(c,[{opacity:0},{opacity:.55,offset:.25},{opacity:.7,offset:.6},{opacity:.55}],{duration:800,easing:'ease-in-out'});
   if(reduced)return;const s=selected;[...document.querySelectorAll('.peg')].forEach(p=>{const i=+p.dataset.string;if(i===s)return;const m=p.querySelector('.peg-motion');anim(m,[{translate:'0 0'},{translate:'0 -2px',offset:.5,easing:'ease-in'},{translate:'0 0'}],{duration:250,delay:60+Math.abs(i-s)*50,easing:'ease-out'});});},land);};
+
+// --- all-6-done family celebration (Kaito timing; each child hops from its own peg to a smiling arch) ---
+window.__celebrate=()=>{const u=unit(),pegs=[...document.querySelectorAll('.peg')],from=pegs.map(p=>p.getBoundingClientRect());log.push({k:'celebrate',t:now()});
+ clearTimeout(finishTimer);
+ pegs.forEach((p,i)=>{const k=(i-2.5)/2.5;p.style.setProperty('--order',i);p.style.setProperty('--arch',`${(8*(1-k*k)).toFixed(1)}px`);p.classList.add('parade');});
+ const to=pegs.map(p=>p.getBoundingClientRect());
+ const later=(ms,f)=>setTimeout(()=>{if(allDone)f();},ms);
+ if(reduced){finishTimer=setTimeout(()=>{if(allDone)button(true,true);},1500);return;}
+ // 200ms: gather as hopping arcs from each peg, 6→1, 40ms stagger
+ pegs.forEach((p,i)=>{const dx=from[i].x-to[i].x,dy=from[i].y-to[i].y;p.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:`translate(${dx*.5}px,${dy*.5-u*.14}px)`,offset:.5},{transform:'translate(0,0)'}],{duration:600,delay:200+i*40,easing:'cubic-bezier(.22,1,.36,1)',fill:'backwards'});});
+ // 1000ms: wave jump 6→1 (90ms spacing) + each string lights up in its colour
+ pegs.forEach((p,i)=>later(1000+i*90,()=>{const m=p.querySelector('.peg-motion'),h=-.05*u;m.animate([{translate:'0 0',scale:'1 1'},{translate:'0 0',scale:'1.08 .92',offset:.15},{translate:`0 ${h}px`,scale:'.95 1.06',offset:.45},{translate:'0 0',scale:'1.08 .93',offset:.7},{translate:'0 0',scale:'.98 1.02',offset:.85},{translate:'0 0',scale:'1 1'}],{duration:480,easing:'ease-out'});
+  const w=document.getElementById('wire-'+i);if(w){w.setAttribute('stroke',stringColors[i]);w.animate([{opacity:1},{opacity:.35}],{duration:300,fill:'forwards'});}}));
+ // 1700ms: everyone squeezes, bounces together, wobbles; one sparkle each; cheeks pulse
+ later(1700,()=>pegs.forEach((p,i)=>{const m=p.querySelector('.peg-motion'),h=-.04*u;m.animate([{translate:'0 0',scale:'1 1'},{translate:'0 0',scale:'1.08 .92',offset:.2},{translate:`0 ${h}px`,scale:'.96 1.05',offset:.42},{translate:'0 0',scale:'1.12 .88',offset:.55},{scale:'.96 1.04',offset:.7},{scale:'1.03 .97',offset:.85},{translate:'0 0',scale:'1 1'}],{duration:600,easing:'ease-out'});
+  const c=p.querySelector('.cheeks');if(c)c.animate([{opacity:.55},{opacity:.7},{opacity:.55}],{duration:600});
+  later(120,()=>{const sp=document.createElementNS('http://www.w3.org/2000/svg','svg');sp.setAttribute('viewBox','0 0 12 12');sp.setAttribute('class','sparkle');sp.innerHTML=`<path d="M6 0Q6.8 5.2 12 6Q6.8 6.8 6 12Q5.2 6.8 0 6Q5.2 5.2 6 0Z" fill="${stringColors[i]}"/>`;p.append(sp);sp.animate([{transform:'translateY(0) scale(.6)',opacity:1},{transform:'translateY(-12px) scale(1)',opacity:0}],{duration:500,easing:'ease-out',fill:'forwards'}).onfinish=()=>sp.remove();});}));
+ // 2300ms: lean toward each other (hug) and sway in sync; 1弦 keeps eyes open and looks around
+ later(2300,()=>{const t0=document.timeline.currentTime;pegs.forEach((p,i)=>{const lean=i<2.5?3:-3,m=p.querySelector('.peg-motion');p.querySelector('.peg-tilt').animate([{rotate:'0deg'},{rotate:lean+'deg'}],{duration:400,easing:'cubic-bezier(.22,1,.36,1)',fill:'forwards'});
+   const a=m.animate([{rotate:'-2deg'},{rotate:'2deg'},{rotate:'-2deg'}],{duration:2400,iterations:Infinity,easing:'ease-in-out'});a.startTime=Math.ceil(t0/2400)*2400;});
+  const one=pegs[5];one.classList.add('awake-one');(function look(){later(R(1800,3500),()=>{const e=document.querySelector('.peg.awake-one .eyes');if(e)e.animate([{translate:'0 0'},{translate:`${Math.random()<.5?-2:2}px 0`,offset:.15},{translate:`${Math.random()<.5?-2:2}px 0`,offset:.85},{translate:'0 0'}],{duration:R(1000,1800),easing:'ease-in-out'});if(Math.random()<.5)blink(document.querySelector('.peg.awake-one svg'));look();});})();});
+ // 6000ms: only the 6弦 child tilts its head — "もう一回?" (tap it to start over)
+ finishTimer=setTimeout(()=>{if(allDone)button(true,true);},6000);};
 // --- cheerful reset (もう一回!) ---
 const baseReset=resetAll;resetAll=window.__tunerReset=function(){baseReset();log.push({k:'reset',t:now()});if(reduced)return;anim($('jumper'),[{rotate:'0deg'},{rotate:'-4deg',offset:.2},{rotate:'4deg',offset:.45},{rotate:'-2deg',offset:.7},{rotate:'0deg'}],{duration:520,easing:'ease-out'});const e=eyesOf($('buddy'));setTimeout(()=>{blink($('buddy'));anim(eyesOf($('buddy')),[{translate:'0 0'},{translate:'0 -2px',offset:.2},{translate:'0 -2px',offset:.8},{translate:'0 0'}],{duration:800,delay:220,easing:E});},380);};
 // --- peg tap squish ---
@@ -269,7 +361,7 @@ function frame(t){requestAnimationFrame(frame);if(!running||document.hidden)retu
  const b=$('buddy');b.classList.toggle('breath',mainIdle()||(inTune&&!allDone));app.classList.toggle('content',inTune);
  // siblings watch the centre (eyes only, max 2px, staggered 40ms)
  if(selected!==selSeen){selSeen=selected;watchAt=t;}const jr=j.getBoundingClientRect(),cx=jr.x+jr.width/2,cy=jr.y+jr.height/2;
- document.querySelectorAll('.peg').forEach(p=>{const i=+p.dataset.string,ey=p.querySelector('.eyes');if(!ey)return;const r=p.getBoundingClientRect(),dx=cx-r.x-r.width/2,dy=cy-r.y-r.height/2,n=Math.hypot(dx,dy)||1,on=!p.classList.contains('current')&&t-watchAt>40*Math.abs(i-selected)?1:0;ey.style.transition='translate 200ms cubic-bezier(.22,1,.36,1)';ey.style.translate=`${(on*2*dx/n).toFixed(2)}px ${(on*2*dy/n).toFixed(2)}px`;
+ document.querySelectorAll('.peg').forEach(p=>{const i=+p.dataset.string,ey=p.querySelector('.eyes');if(!ey||allDone)return;const r=p.getBoundingClientRect(),dx=cx-r.x-r.width/2,dy=cy-r.y-r.height/2,n=Math.hypot(dx,dy)||1,on=!p.classList.contains('current')&&t-watchAt>40*Math.abs(i-selected)?1:0;ey.style.transition='translate 200ms cubic-bezier(.22,1,.36,1)';ey.style.translate=`${(on*2*dx/n).toFixed(2)}px ${(on*2*dy/n).toFixed(2)}px`;
   const mo=p.querySelector('.peg-motion');if(!reduced&&p.classList.contains('done')&&!allDone&&!p.classList.contains('current'))mo.style.rotate=(2.5*Math.sin(t/1000*Math.PI*2/2.6)).toFixed(2)+'deg';else if(mo.style.rotate)mo.style.rotate='';});
 }requestAnimationFrame(frame);
 })();
